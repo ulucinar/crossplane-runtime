@@ -18,12 +18,15 @@ package managed
 
 import (
 	"context"
+	"encoding/json"
 
+	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,10 +36,20 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 )
 
+const (
+	// fieldOwnerAPISimpleRefResolver owns the reference fields
+	// the managed reconciler resolves.
+	fieldOwnerAPISimpleRefResolver = "managed.crossplane.io/api-simple-reference-resolver"
+)
+
 // Error strings.
 const (
 	errCreateOrUpdateSecret      = "cannot create or update connection secret"
 	errUpdateManaged             = "cannot update managed resource"
+	errPatchManaged              = "cannot patch the managed resource via server-side apply"
+	errMarshalExisting           = "cannot marshal the existing object into JSON"
+	errMarshalResolved           = "cannot marshal the object with the resolved references into JSON"
+	errPreparePatch              = "cannot prepare the JSON merge patch for the resolved object"
 	errUpdateManagedStatus       = "cannot update managed resource status"
 	errResolveReferences         = "cannot resolve references"
 	errUpdateCriticalAnnotations = "cannot update critical annotations"
@@ -145,13 +158,26 @@ func (a *APISimpleReferenceResolver) ResolveReferences(ctx context.Context, mg r
 	if err := rr.ResolveReferences(ctx, a.client); err != nil {
 		return errors.Wrap(err, errResolveReferences)
 	}
-
-	if cmp.Equal(existing, mg) {
+	if cmp.Equal(existing, mg, cmpopts.EquateEmpty()) {
 		// The resource didn't change during reference resolution.
 		return nil
 	}
 
-	return errors.Wrap(a.client.Update(ctx, mg), errUpdateManaged)
+	existing.GetObjectKind().SetGroupVersionKind(schema.GroupVersionKind{})
+	eBuff, err := json.Marshal(existing)
+	if err != nil {
+		return errors.Wrap(err, errMarshalExisting)
+	}
+	rBuff, err := json.Marshal(mg)
+	if err != nil {
+		return errors.Wrap(err, errMarshalResolved)
+	}
+	patch, err := jsonpatch.CreateMergePatch(eBuff, rBuff)
+	if err != nil {
+		return errors.Wrap(err, errPreparePatch)
+	}
+
+	return errors.Wrap(a.client.Patch(ctx, mg, client.RawPatch(types.ApplyPatchType, patch), client.FieldOwner(fieldOwnerAPISimpleRefResolver), client.ForceOwnership), errPatchManaged)
 }
 
 // A RetryingCriticalAnnotationUpdater is a CriticalAnnotationUpdater that
