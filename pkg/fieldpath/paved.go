@@ -51,6 +51,7 @@ func IsNotFound(err error) bool {
 type Paved struct {
 	object            map[string]any
 	maxFieldPathIndex uint
+	noJSONValidation  bool
 }
 
 // PavedOption can be used to configure a Paved behavior.
@@ -78,6 +79,14 @@ func Pave(object map[string]any, opts ...PavedOption) *Paved {
 func WithMaxFieldPathIndex(max uint) PavedOption {
 	return func(paved *Paved) {
 		paved.maxFieldPathIndex = max
+	}
+}
+
+// WithDisableJSONValidation returns a PavedOption that disables the JSON
+// validation of the values passed to Paved.SetValue.
+func WithDisableJSONValidation() PavedOption {
+	return func(paved *Paved) {
+		paved.noJSONValidation = true
 	}
 }
 
@@ -340,13 +349,17 @@ func (p *Paved) GetInteger(path string) (int64, error) {
 }
 
 func (p *Paved) setValue(s Segments, value any) error {
-	// We expect p.object to look like JSON data that was unmarshalled into an
-	// any per https://golang.org/pkg/encoding/json/#Unmarshal. We
-	// marshal our value to JSON and unmarshal it into an any to ensure
-	// it meets these criteria before setting it within p.object.
-	v, err := toValidJSON(value)
-	if err != nil {
-		return err
+	v := value
+	if !p.noJSONValidation {
+		// We expect p.object to look like JSON data that was unmarshalled into an
+		// any per https://golang.org/pkg/encoding/json/#Unmarshal. We
+		// marshal our value to JSON and unmarshal it into an any to ensure
+		// it meets these criteria before setting it within p.object.
+		t, err := toValidJSON(value)
+		if err != nil {
+			return err
+		}
+		v = t
 	}
 
 	if err := p.validateSegments(s); err != nil {
