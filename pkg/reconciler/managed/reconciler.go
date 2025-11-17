@@ -1103,23 +1103,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 	}
 
-	// If we started but never completed creation of an external resource we
-	// may have lost critical information. For example if we didn't persist
-	// an updated external name which is non-deterministic, we have leaked a
-	// resource. The safest thing to do is to refuse to proceed. However, if
-	// the resource has a deterministic external name, it is safe to proceed.
-	if meta.ExternalCreateIncomplete(managed) {
-		if !r.deterministicExternalName {
-			log.Debug(errCreateIncomplete)
-			record.Event(managed, event.Warning(reasonCannotInitialize, errors.New(errCreateIncomplete)))
-			status.MarkConditions(xpv1.Creating(), xpv1.ReconcileError(errors.New(errCreateIncomplete)))
-
-			return reconcile.Result{Requeue: false}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
-		}
-
-		log.Debug("Cannot determine creation result, but proceeding due to deterministic external name")
-	}
-
 	// We resolve any references before observing our external resource because
 	// in some rare examples we need a spec field to make the observe call, and
 	// that spec field could be set by a reference.
@@ -1202,6 +1185,33 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 	}
 
+	// If we started but never completed creation of an external resource we
+	// may have lost critical information. For example if we didn't persist
+	// an updated external name which is non-deterministic, we have leaked a
+	// resource. The safest thing to do is to refuse to proceed. However, if
+	// the resource has a deterministic external name, it is safe to proceed.
+	// TODO: I've preferred to move the meta.ExternalCreateIncomplete call after the call to
+	//  the external client's Observe call because at this point, we would like to know if
+	//  there's an async operation going on. Previously, we were erroring early if there's an
+	//  external-create pending annotation (but no failed or succeeded) without:
+	//  - Resolving cross-resource references (if the resource is not yet deleted)
+	//  - Connecting
+	//  - Observing
+	//  An alternative could be marking the reconciliation as an async reconciliation in
+	//  the reconciler context and relying on that state.
+	//  Howeever, it looks like the above operations are safe even we've leaked a resource.
+	if observation.AsyncPhase != AsyncCreatePending && !observation.AsyncPhase.CreationCompleted() && meta.ExternalCreateIncomplete(managed) {
+		if !r.deterministicExternalName {
+			log.Debug(errCreateIncomplete)
+			record.Event(managed, event.Warning(reasonCannotInitialize, errors.New(errCreateIncomplete)))
+			status.MarkConditions(xpv1.Creating(), xpv1.ReconcileError(errors.New(errCreateIncomplete)))
+
+			return reconcile.Result{Requeue: false}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+		}
+
+		log.Debug("Cannot determine creation result, but proceeding due to deterministic external name")
+	}
+
 	// In the observe-only mode, !observation.ResourceExists will be an error
 	// case, and we will explicitly return this information to the user.
 	if !observation.ResourceExists && policy.ShouldOnlyObserve() {
@@ -1216,16 +1226,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		return reconcile.Result{RequeueAfter: defaultFastPollInterval}, nil
 	} else if observation.AsyncPhase.CreationCompleted() { // TODO: should we be updating critical annotations if AsyncCreateFailed?
 		// TODO: we need to consider how to handle changelogs!!!
-		return r.handleCreationResult(ctx, log, record, managed, nil, ExternalCreation{
-			ConnectionDetails: observation.ConnectionDetails,
-			AdditionalDetails: observation.AdditionalDetails, // TODO: related to changelogs!!!
-		}, status, observation.AsyncError)
+		return r.handleCreationResult(ctx, log, record, managed, nil,
+			ExternalCreation{
+				AsyncOperation:    observation.AsyncOperation,
+				ConnectionDetails: observation.ConnectionDetails,
+				AdditionalDetails: observation.AdditionalDetails, // TODO: related to changelogs!!!
+			}, status, observation.AsyncError)
 	} else if observation.AsyncPhase.UpdateCompleted() {
 		// TODO: we need to consider how to handle changelogs!!!
-		return r.handleUpdateResult(ctx, log, record, managed, nil, ExternalUpdate{
-			ConnectionDetails: observation.ConnectionDetails,
-			AdditionalDetails: observation.AdditionalDetails,
-		}, status, observation.AsyncError)
+		return r.handleUpdateResult(ctx, log, record, managed, nil,
+			ExternalUpdate{
+				AsyncOperation:    observation.AsyncOperation,
+				ConnectionDetails: observation.ConnectionDetails,
+				AdditionalDetails: observation.AdditionalDetails,
+			}, status, observation.AsyncError)
 	}
 
 	// If this resource has a non-zero creation grace period we want to wait
@@ -1501,7 +1515,10 @@ func (r *Reconciler) handleCreationResult(ctx context.Context, log logging.Logge
 
 	// if resource is still in async create pending state, return early.
 	if creation.AsyncPhase == AsyncCreatePending {
-		return reconcile.Result{RequeueAfter: defaultFastPollInterval}, nil
+		status.MarkConditions(xpv1.Creating(), xpv1.ReconcileSuccess())
+		// TODO: check if we exponentially-backoff in case the status update fails,
+		//  instead of reconciling after the fixed defaultFastPollInterval...
+		return reconcile.Result{RequeueAfter: defaultFastPollInterval}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 	}
 
 	// In some cases our external-name may be set by Create above.
@@ -1551,6 +1568,23 @@ func (r *Reconciler) handleCreationResult(ctx context.Context, log logging.Logge
 		status.MarkConditions(xpv1.Creating(), xpv1.ReconcileError(err))
 
 		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+	}
+
+	// TODO: we need to be careful here as the previous implementation requests
+	//  a new reconciliation to observe the resource again to "make sure" it's ready.
+	//  However, in async mode, we've already observed the resource as exists in
+	//  response to probably a reconciliation request from upjet (via the async callback handler).
+	//  So, it should have the same semantics if the reported async phase from upjet is
+	//  succeeded here.
+	if creation.AsyncPhase == AsyncCreateSucceeded {
+		log.Debug("Successfully created external resource")
+		record.Event(managed, event.Normal(reasonCreated, "Successfully created external resource"))
+		status.MarkConditions(xpv1.Available(), xpv1.ReconcileSuccess())
+
+		r.metricRecorder.recordFirstTimeReady(managed)
+
+		reconcileAfter := r.pollIntervalHook(managed, r.pollInterval)
+		return reconcile.Result{RequeueAfter: reconcileAfter}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 	}
 
 	// We've successfully created our external resource. In many cases the
