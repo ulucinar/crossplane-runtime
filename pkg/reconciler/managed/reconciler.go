@@ -48,8 +48,9 @@ const (
 	reconcileGracePeriod = 30 * time.Second
 	reconcileTimeout     = 1 * time.Minute
 
-	defaultPollInterval = 1 * time.Minute
-	defaultGracePeriod  = 30 * time.Second
+	defaultPollInterval     = 1 * time.Minute
+	defaultFastPollInterval = 30 * time.Second
+	defaultGracePeriod      = 30 * time.Second
 )
 
 // Error strings.
@@ -482,11 +483,49 @@ func (c *NopClient) Delete(_ context.Context, _ resource.Managed) (ExternalDelet
 // Disconnect does nothing. It never returns an error.
 func (c *NopClient) Disconnect(_ context.Context) error { return nil }
 
+type AsyncPhase string
+
+const (
+	AsyncCreatePending   AsyncPhase = "create-pending"
+	AsyncCreateSucceeded AsyncPhase = "create-succeeded"
+	AsyncCreateFailed    AsyncPhase = "create-failed"
+	AsyncUpdatePending   AsyncPhase = "update-pending"
+	AsyncUpdateSucceeded AsyncPhase = "update-succeeded"
+	AsyncUpdateFailed    AsyncPhase = "update-failed"
+	AsyncDeletePending   AsyncPhase = "delete-pending"
+	AsyncDeleteSucceeded AsyncPhase = "delete-succeeded"
+	AsyncDeleteFailed    AsyncPhase = "delete-failed"
+
+	AsyncInvalidPhase AsyncPhase = ""
+)
+
+func (p AsyncPhase) CreationCompleted() bool {
+	return p == AsyncCreateSucceeded || p == AsyncCreateFailed
+}
+
+func (p AsyncPhase) UpdateCompleted() bool {
+	return p == AsyncUpdateSucceeded || p == AsyncUpdateFailed
+}
+
+type AsyncOperation struct {
+	AsyncPhase AsyncPhase
+	AsyncError error
+}
+
+func (op *AsyncOperation) HasCompleted() bool {
+	switch op.AsyncPhase {
+	case AsyncCreatePending, AsyncUpdatePending, AsyncDeletePending:
+		return false
+	default:
+		return true
+	}
+}
+
 // An ExternalObservation is the result of an observation of an external
 // resource.
 type ExternalObservation struct {
 	// ResourceExists must be true if a corresponding external resource exists
-	// for the managed resource. Typically this is proven by the presence of an
+	// for the managed resource. Typically, this is proven by the presence of an
 	// external resource of the expected kind whose unique identifier matches
 	// the managed resource's external name. Crossplane uses this information to
 	// determine whether it needs to create or delete the external resource.
@@ -521,11 +560,17 @@ type ExternalObservation struct {
 	// credentials to a store (e.g. a Secret).
 	ConnectionDetails ConnectionDetails
 
+	// AdditionalDetails represent any additional details the external client
+	// wants to return about the creation operation that was performed.
+	AdditionalDetails AdditionalDetails
+
 	// Diff is a Debug level message that is sent to the reconciler when
 	// there is a change in the observed Managed Resource. It is useful for
 	// finding where the observed diverges from the desired state.
 	// The string should be a cmp.Diff that details the difference.
 	Diff string
+
+	AsyncOperation
 }
 
 // An ExternalCreation is the result of the creation of an external resource.
@@ -540,6 +585,8 @@ type ExternalCreation struct {
 	// AdditionalDetails represent any additional details the external client
 	// wants to return about the creation operation that was performed.
 	AdditionalDetails AdditionalDetails
+
+	AsyncOperation
 }
 
 // An ExternalUpdate is the result of an update to an external resource.
@@ -554,6 +601,8 @@ type ExternalUpdate struct {
 	// AdditionalDetails represent any additional details the external client
 	// wants to return about the update operation that was performed.
 	AdditionalDetails AdditionalDetails
+
+	AsyncOperation
 }
 
 // An ExternalDelete is the result of a deletion of an external resource.
@@ -561,7 +610,16 @@ type ExternalDelete struct {
 	// AdditionalDetails represent any additional details the external client
 	// wants to return about the delete operation that was performed.
 	AdditionalDetails AdditionalDetails
+
+	AsyncOperation
 }
+
+type ReconciliationMode string
+
+const (
+	AsyncMode ReconciliationMode = "async"
+	SyncMode  ReconciliationMode = "sync"
+)
 
 // A Reconciler reconciles managed resources by creating and managing the
 // lifecycle of an external resource, i.e. a resource in an external system such
@@ -595,6 +653,8 @@ type Reconciler struct {
 	metricRecorder            MetricRecorder
 	change                    ChangeLogger
 	deterministicExternalName bool
+
+	mode ReconciliationMode
 }
 
 type mrManaged struct {
@@ -841,6 +901,12 @@ func WithDeterministicExternalName(b bool) ReconcilerOption {
 	}
 }
 
+func WithReconciliationMode(mode ReconciliationMode) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.mode = mode
+	}
+}
+
 // NewReconciler returns a Reconciler that reconciles managed resources of the
 // supplied ManagedKind with resources in an external system such as a cloud
 // provider API. It panics if asked to reconcile a managed resource kind that is
@@ -873,6 +939,7 @@ func NewReconciler(m manager.Manager, of resource.ManagedKind, o ...ReconcilerOp
 		metricRecorder:              NewNopMetricRecorder(),
 		change:                      newNopChangeLogger(),
 		conditions:                  new(conditions.ObservedGenerationPropagationManager),
+		mode:                        SyncMode,
 	}
 
 	for _, ro := range o {
@@ -1144,6 +1211,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 	}
 
+	// if there's an ongoing async operation
+	if observation.AsyncPhase != AsyncInvalidPhase && !observation.HasCompleted() {
+		return reconcile.Result{RequeueAfter: defaultFastPollInterval}, nil
+	} else if observation.AsyncPhase.CreationCompleted() { // TODO: should we be updating critical annotations if AsyncCreateFailed?
+		// TODO: we need to consider how to handle changelogs!!!
+		return r.handleCreationResult(ctx, log, record, managed, nil, ExternalCreation{
+			ConnectionDetails: observation.ConnectionDetails,
+			AdditionalDetails: observation.AdditionalDetails, // TODO: related to changelogs!!!
+		}, status, observation.AsyncError)
+	} else if observation.AsyncPhase.UpdateCompleted() {
+		// TODO: we need to consider how to handle changelogs!!!
+		return r.handleUpdateResult(ctx, log, record, managed, nil, ExternalUpdate{
+			ConnectionDetails: observation.ConnectionDetails,
+			AdditionalDetails: observation.AdditionalDetails,
+		}, status, observation.AsyncError)
+	}
+
 	// If this resource has a non-zero creation grace period we want to wait
 	// for that period to expire before we trust that the resource really
 	// doesn't exist. This is because some external APIs are eventually
@@ -1296,6 +1380,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		// update to fail if we get a 409 due to a stale version.
 		meta.SetExternalCreatePending(managed, time.Now())
 
+		// TODO: why is this not done using the critical annotations updaters?
+		//  Probably because at this point we have not previously recorded anything yet,
+		//  and we are not recording the external-name annotation,
+		//  so we don't mind if the annotation update fails here.
 		if err := r.client.Update(ctx, managed); err != nil {
 			log.Debug(errUpdateManaged, "error", err)
 
@@ -1310,104 +1398,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		}
 
 		creation, err := external.Create(externalCtx, managed)
-		if err != nil {
-			// We'll hit this condition if we can't create our external
-			// resource, for example if our provider credentials don't have
-			// access to create it. If this is the first time we encounter this
-			// issue we'll be requeued implicitly when we update our status with
-			// the new error condition. If not, we requeue explicitly, which will trigger backoff.
-			log.Debug("Cannot create external resource", "error", err)
-
-			if !kerrors.IsConflict(err) {
-				record.Event(managed, event.Warning(reasonCannotCreate, err))
-			}
-
-			// We handle annotations specially here because it's
-			// critical that they are persisted to the API server.
-			// If we don't add the external-create-failed annotation
-			// the reconciler will refuse to proceed, because it
-			// won't know whether or not it created an external
-			// resource.
-			meta.SetExternalCreateFailed(managed, time.Now())
-
-			if err := r.managed.UpdateCriticalAnnotations(ctx, managed); err != nil {
-				log.Debug(errUpdateManagedAnnotations, "error", err)
-				record.Event(managed, event.Warning(reasonCannotUpdateManaged, errors.Wrap(err, errUpdateManagedAnnotations)))
-
-				// We only log and emit an event here rather
-				// than setting a status condition and returning
-				// early because presumably it's more useful to
-				// set our status condition to the reason the
-				// create failed.
-			}
-
-			if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_CREATE, err, creation.AdditionalDetails); err != nil {
-				log.Info(errRecordChangeLog, "error", err)
-			}
-
-			status.MarkConditions(xpv1.Creating(), xpv1.ReconcileError(errors.Wrap(err, errReconcileCreate)))
-
-			return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
-		}
-
-		// In some cases our external-name may be set by Create above.
-		log = log.WithValues("external-name", meta.GetExternalName(managed))
-		record = r.record.WithAnnotations("external-name", meta.GetExternalName(managed))
-
-		if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_CREATE, nil, creation.AdditionalDetails); err != nil {
-			log.Info(errRecordChangeLog, "error", err)
-		}
-
-		// We handle annotations specially here because it's critical
-		// that they are persisted to the API server. If we don't remove
-		// add the external-create-succeeded annotation the reconciler
-		// will refuse to proceed, because it won't know whether or not
-		// it created an external resource. This is also important in
-		// cases where we must record an external-name annotation set by
-		// the Create call. Any other changes made during Create will be
-		// reverted when annotations are updated; at the time of writing
-		// Create implementations are advised not to alter status, but
-		// we may revisit this in future.
-		meta.SetExternalCreateSucceeded(managed, time.Now())
-
-		if err := r.managed.UpdateCriticalAnnotations(ctx, managed); err != nil {
-			log.Debug(errUpdateManagedAnnotations, "error", err)
-
-			if kerrors.IsConflict(err) {
-				return reconcile.Result{Requeue: true}, nil
-			}
-
-			record.Event(managed, event.Warning(reasonCannotUpdateManaged, errors.Wrap(err, errUpdateManagedAnnotations)))
-			status.MarkConditions(xpv1.Creating(), xpv1.ReconcileError(errors.Wrap(err, errUpdateManagedAnnotations)))
-
-			return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
-		}
-
-		if _, err := r.managed.PublishConnection(ctx, managed, creation.ConnectionDetails); err != nil {
-			// If this is the first time we encounter this issue we'll be
-			// requeued implicitly when we update our status with the new error
-			// condition. If not, we requeue explicitly, which will trigger backoff.
-			log.Debug("Cannot publish connection details", "error", err)
-
-			if kerrors.IsConflict(err) {
-				return reconcile.Result{Requeue: true}, nil
-			}
-
-			record.Event(managed, event.Warning(reasonCannotPublish, err))
-			status.MarkConditions(xpv1.Creating(), xpv1.ReconcileError(err))
-
-			return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
-		}
-
-		// We've successfully created our external resource. In many cases the
-		// creation process takes a little time to finish. We requeue explicitly
-		// order to observe the external resource to determine whether it's
-		// ready for use.
-		log.Debug("Successfully requested creation of external resource")
-		record.Event(managed, event.Normal(reasonCreated, "Successfully requested creation of external resource"))
-		status.MarkConditions(xpv1.Creating(), xpv1.ReconcileSuccess())
-
-		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+		return r.handleCreationResult(ctx, log, record, managed, managedPreOp, creation, status, err)
 	}
 
 	if observation.ResourceLateInitialized && policy.ShouldLateInitialize() {
@@ -1461,7 +1452,119 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		return reconcile.Result{RequeueAfter: reconcileAfter}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 	}
 
+	// here we know that resource is not up-to-date,
+	// because there's an early return above if the resource is up-to-date.
 	update, err := external.Update(externalCtx, managed)
+	return r.handleUpdateResult(ctx, log, record, managed, managedPreOp, update, status, err)
+}
+
+func (r *Reconciler) handleCreationResult(ctx context.Context, log logging.Logger, record event.Recorder, managed, managedPreOp resource.Managed, creation ExternalCreation, status conditions.ConditionSet, err error) (reconcile.Result, error) {
+	if err != nil {
+		// We'll hit this condition if we can't create our external
+		// resource, for example if our provider credentials don't have
+		// access to create it. If this is the first time we encounter this
+		// issue we'll be requeued implicitly when we update our status with
+		// the new error condition. If not, we requeue explicitly, which will trigger backoff.
+		log.Debug("Cannot create external resource", "error", err)
+
+		if !kerrors.IsConflict(err) {
+			record.Event(managed, event.Warning(reasonCannotCreate, err))
+		}
+
+		// We handle annotations specially here because it's
+		// critical that they are persisted to the API server.
+		// If we don't add the external-create-failed annotation
+		// the reconciler will refuse to proceed, because it
+		// won't know whether or not it created an external
+		// resource.
+		meta.SetExternalCreateFailed(managed, time.Now())
+
+		if err := r.managed.UpdateCriticalAnnotations(ctx, managed); err != nil {
+			log.Debug(errUpdateManagedAnnotations, "error", err)
+			record.Event(managed, event.Warning(reasonCannotUpdateManaged, errors.Wrap(err, errUpdateManagedAnnotations)))
+
+			// We only log and emit an event here rather
+			// than setting a status condition and returning
+			// early because presumably it's more useful to
+			// set our status condition to the reason the
+			// create failed.
+		}
+
+		if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_CREATE, err, creation.AdditionalDetails); err != nil {
+			log.Info(errRecordChangeLog, "error", err)
+		}
+
+		status.MarkConditions(xpv1.Creating(), xpv1.ReconcileError(errors.Wrap(err, errReconcileCreate)))
+
+		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+	}
+
+	// if resource is still in async create pending state, return early.
+	if creation.AsyncPhase == AsyncCreatePending {
+		return reconcile.Result{RequeueAfter: defaultFastPollInterval}, nil
+	}
+
+	// In some cases our external-name may be set by Create above.
+	log = log.WithValues("external-name", meta.GetExternalName(managed))
+	record = r.record.WithAnnotations("external-name", meta.GetExternalName(managed))
+
+	if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_CREATE, nil, creation.AdditionalDetails); err != nil {
+		log.Info(errRecordChangeLog, "error", err)
+	}
+
+	// We handle annotations specially here because it's critical
+	// that they are persisted to the API server. If we don't remove
+	// add the external-create-succeeded annotation the reconciler
+	// will refuse to proceed, because it won't know whether or not
+	// it created an external resource. This is also important in
+	// cases where we must record an external-name annotation set by
+	// the Create call. Any other changes made during Create will be
+	// reverted when annotations are updated; at the time of writing
+	// Create implementations are advised not to alter status, but
+	// we may revisit this in future.
+	meta.SetExternalCreateSucceeded(managed, time.Now())
+
+	if err := r.managed.UpdateCriticalAnnotations(ctx, managed); err != nil {
+		log.Debug(errUpdateManagedAnnotations, "error", err)
+
+		if kerrors.IsConflict(err) {
+			return reconcile.Result{Requeue: true}, nil
+		}
+
+		record.Event(managed, event.Warning(reasonCannotUpdateManaged, errors.Wrap(err, errUpdateManagedAnnotations)))
+		status.MarkConditions(xpv1.Creating(), xpv1.ReconcileError(errors.Wrap(err, errUpdateManagedAnnotations)))
+
+		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+	}
+
+	if _, err := r.managed.PublishConnection(ctx, managed, creation.ConnectionDetails); err != nil {
+		// If this is the first time we encounter this issue we'll be
+		// requeued implicitly when we update our status with the new error
+		// condition. If not, we requeue explicitly, which will trigger backoff.
+		log.Debug("Cannot publish connection details", "error", err)
+
+		if kerrors.IsConflict(err) {
+			return reconcile.Result{Requeue: true}, nil
+		}
+
+		record.Event(managed, event.Warning(reasonCannotPublish, err))
+		status.MarkConditions(xpv1.Creating(), xpv1.ReconcileError(err))
+
+		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+	}
+
+	// We've successfully created our external resource. In many cases the
+	// creation process takes a little time to finish. We requeue explicitly
+	// order to observe the external resource to determine whether it's
+	// ready for use.
+	log.Debug("Successfully requested creation of external resource")
+	record.Event(managed, event.Normal(reasonCreated, "Successfully requested creation of external resource"))
+	status.MarkConditions(xpv1.Creating(), xpv1.ReconcileSuccess())
+
+	return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+}
+
+func (r *Reconciler) handleUpdateResult(ctx context.Context, log logging.Logger, record event.Recorder, managed, managedPreOp resource.Managed, update ExternalUpdate, status conditions.ConditionSet, err error) (reconcile.Result, error) {
 	if err != nil {
 		// We'll hit this condition if we can't update our external resource,
 		// for example if our provider credentials don't have access to update
@@ -1478,6 +1581,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		status.MarkConditions(xpv1.ReconcileError(errors.Wrap(err, errReconcileUpdate)))
 
 		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+	}
+
+	// if resource is still in async create pending state, return early.
+	if update.AsyncPhase == AsyncUpdatePending {
+		return reconcile.Result{RequeueAfter: defaultFastPollInterval}, nil
 	}
 
 	// record the drift after the successful update.
