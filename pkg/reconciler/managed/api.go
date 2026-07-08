@@ -40,6 +40,10 @@ const (
 	// fieldOwnerAPISimpleRefResolver owns the reference fields
 	// the managed reconciler resolves.
 	fieldOwnerAPISimpleRefResolver = "managed.crossplane.io/api-simple-reference-resolver"
+
+	// fieldOwnerManagedStatus owns the status fields the managed reconciler
+	// applies to the managed resource via server-side apply.
+	fieldOwnerManagedStatus = "managed.crossplane.io/status"
 )
 
 // Error strings.
@@ -49,6 +53,7 @@ const (
 	errPatchManaged              = "cannot patch the managed resource via server-side apply"
 	errMarshalExisting           = "cannot marshal the existing object into JSON"
 	errMarshalResolved           = "cannot marshal the object with the resolved references into JSON"
+	errMarshalManaged            = "cannot marshal the managed resource into JSON"
 	errPreparePatch              = "cannot prepare the JSON merge patch for the resolved object"
 	errUpdateManagedStatus       = "cannot update managed resource status"
 	errResolveReferences         = "cannot resolve references"
